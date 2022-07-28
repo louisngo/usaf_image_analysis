@@ -38,7 +38,16 @@ from skimage.io import imread
 from matplotlib.backends.backend_pdf import PdfPages
 from skimage import io
 from skimage.transform import rotate
+from scipy.signal import find_peaks
 import math
+
+LP = np.array(
+    [0.250, 0.281, 0.315, 0.354, 0.397, 0.445,\
+     0.500, 0.561, 0.630, 0.707, 0.794, 0.891,\
+     1.00, 1.12, 1.26, 1.41, 1.59, 1.78,\
+     2.00, 2.24, 2.52, 2.83, 3.17, 3.56,\
+     4.00, 4.49, 5.04, 5.66, 6.35, 7.13,\
+     8.00, 8.98, 10.08, 11.31, 12.70, 14.25])
 
 
 #################### Rotate the image so the bars are X/Y aligned #############
@@ -127,12 +136,10 @@ def find_elements(image,
 
     """
     matches = []
-    # print(image.shape)
-    # print(image.shape[0])
     start = np.log(image.shape[0] / 2) / np.log(scale_increment) - n_scales
     print("Searching for targets", end='')
     for nf in np.logspace(start, start + n_scales, base=scale_increment):
-        if nf < 5:  # There's no point bothering with tiny boxes...
+        if nf < 20:  # There's no point bothering with tiny boxes...
             continue
         templ = template(nf)  # NB n is rounded down from nf
         res = cv2.matchTemplate(image, templ, cv2.TM_CCOEFF_NORMED)
@@ -145,7 +152,6 @@ def find_elements(image,
 
     # Take the matches at different scales and filter out the good ones
     scores = np.array([m[0] for m in matches])
-    #threshold_score = (scores.max() + scores.min()) / 2
     threshold_score = (scores.max() + scores.min()) / 2
     filtered_matches = [m for m in matches if m[0] > threshold_score]
     # filtered_matches = matches
@@ -191,7 +197,7 @@ def find_elements(image,
         return elements
 
 
-def plot_matches(image, elements, elements_T=[]):
+def plot_matches(image, elements, elements_T=[], pdf=None):
     """Plot the image, then highlight the groups."""
     f, ax = plt.subplots(1, 1)
     if len(image.shape) == 2:
@@ -206,239 +212,125 @@ def plot_matches(image, elements, elements_T=[]):
     for score, (y, x), n in elements_T:
         ax.add_patch(matplotlib.patches.Rectangle((x, y), n, n,
                                                   fc='none', ec='blue'))
-    return f
+
+    pdf.savefig(f)
+    plt.close(f)
+    # return f
 
 
-def find_peak_position(y, **kwargs):
-    """Use spline interpolation to find the peak position of a curve.
+def approx_contrast(image, pdf=None, ax=None):
+    # get index of middle row
+    mid_row = image.shape[0] // 2
+    # width is 3
+    map_center, mip_center, min_peaks, max_peaks = approx_contrast_by_row(image, mid_row)
+    y = image[mid_row]
+    x = [x for x in range(len(y))]
+    ax.plot(max_peaks, y[max_peaks], "x", color='red')
+    ax.plot(min_peaks, y[min_peaks], "x", color='red')
+    ax.plot(x, y)
 
-    We differentiate the curve numerically (no smoothing) then use a spline to
-    find the root closest to the middle.  Additional keyword arguments are
-    passed to `scipy.interpolate.UnivariateSpline`.
-
-    returns: the floating-point x value (i.e. index) of the peak.
-    """
-    n = len(y)
-    try:
-        spline = scipy.interpolate.UnivariateSpline(np.arange(n - 1) + 0.5,
-                                                    np.diff(y), **kwargs)
-    except Exception as e:
-        print("Problem: spline failed for data of size {}".format(n))
-        raise e
-    return spline.roots()[np.argmin((spline.roots() - n / 2) ** 2)]  # pick centre root
+    map_bot, mip_bot, _, _ = approx_contrast_by_row(image, mid_row + 1)
+    map_top, mip_top, _, _ = approx_contrast_by_row(image, mid_row - 1)
+    map_mean = (map_center + map_bot + map_top -
+                mip_center - mip_bot - mip_top) / (map_center +
+                                                   map_bot + map_top +
+                                                   mip_center + mip_bot + mip_top)
+    pdf.attach_note(f'Contrast (3 rows): {map_mean}')
+    pdf.savefig()
+    plt.close()
+    return map_mean
 
 
-# Now we've got a list of good elements in the image, with approximate sizes.
-# We can extract these for further analysis.
-def analyse_elements(image, elements, plot=False):
-    """Calculate the precise period of each group of bars, from autocorrelation
+def approx_contrast_by_row(image, row):
+    y = image[row]
 
-    returns: a list of tuples, (p1, p2) for each element, where p1 and p2 are
-    the distances between the two outer bars and the central bar.
+    # adapt if no. of local minima/maxima is unequal 3
+    min_dist = len(y) // 4
+    max_peaks, _ = find_peaks(y, height=0, distance=min_dist)
+    # discard 4th local maxima
+    if len(max_peaks) == 4:
+        max_peaks = max_peaks[:-1]
 
-    It also correlates each row of the image with the average row, which allows
-    us to correct the values for tilt.
-    """
-    print('num_el:', len(elements))
+    min_peaks, _ = find_peaks(-y, height=0, distance=min_dist)
+    if len(min_peaks) == 4:
+        min_peaks = min_peaks[:-1]
 
-    # elements = elements[-5:]
+    sum_map = sum([y[x] for x in max_peaks])
+    sum_mip = sum([y[x] for x in min_peaks])
+    return sum_map, sum_mip, max_peaks, min_peaks
 
-    if plot:
-        f, axes = plt.subplots(2, len(elements))
-    else:
-        f, axes = None, [[None] * len(elements)] * 2
-    analysis = []
+
+def compute_mtf_curve(image, elements, pdf=None):
+    _, axes = None, [[None] * len(elements)] * 2
+    contrasts = []
+
     for (score, (x, y), n), ax0, ax1 in zip(elements, axes[0], axes[1]):
-        try:
-            gray_roi = image[y:y + n, x:x + n]
-            print(gray_roi.shape)
-            marginal = np.mean(gray_roi[n * 3 // 14:-n * 3 // 14, :], axis=0)
-            # average over the bars, ignoring the ends
-            target = marginal[np.newaxis, n // 14:-n // 14].astype(np.uint8)
-            # target is a 1px-high image with 3 bars in it
-            # We correlate the thin target with each row of the image, to
-            # recover the tilt of the image.
-            slant = cv2.matchTemplate(gray_roi[n * 3 // 14:-n * 3 // 14, :],
-                                      target.astype(np.uint8), cv2.TM_CCOEFF_NORMED)
-            # threshold and centre of mass for each row
-            slant -= slant.min(axis=1)[:, np.newaxis]
-            slant /= slant.max(axis=1)[:, np.newaxis]
-            slant -= 0.8
-            slant[slant < 0] = 0
-            shifts = np.sum(slant * np.arange(slant.shape[1]), axis=1) / np.sum(slant, axis=1)
-            gradient, offset = np.polyfit(np.arange(len(shifts)), shifts, 1)
-            tilt = np.arctan(gradient)  # fit the peak in each row to find the angle
+        f, (ax1, ax2) = plt.subplots(1, 2)
+        gray_roi = image[y:y + n, x:x + n]
+        ax1.imshow(gray_roi)
+        ax1.plot()
+        contrasts.append(approx_contrast(gray_roi, pdf, ax2))
 
-            centre = marginal[n * 5 // 14:n * 9 // 14]  # the central bar
-            ccor = np.convolve(marginal, centre[::-1] - np.mean(centre), mode='valid')
-            # NB the central peak will always be at ccor[n*5//14]
-            # Outer peaks should be that +/- n*2//7
-            if plot: ax1.plot(np.abs(np.arange(len(ccor)) - n * 5 // 14), ccor)
-            maxcor = ccor[n * 5 // 14]
-            period_1 = n * 5 // 14 - find_peak_position(ccor[:n // 7])
-            period_1 *= np.cos(tilt)
-            period_2 = find_peak_position(ccor[4 * n // 7:]) + 4 * n // 7 - n * 5 // 14
-            period_2 *= np.cos(tilt)
-            if plot:
-                for x in [period_1, period_2]:
-                    ax1.plot(np.abs([x, x]), [0, maxcor])
-                ax0.imshow(gray_roi, cmap="cubehelix")
-                ax0.axis("off")
-                ys = np.arange(len(shifts)) + 3 * n // 14
-                cx = (n - 1.) / 2
-                ax0.plot(shifts - np.mean(shifts) + cx, ys, 'r+')  # plot fitted X values
-                for x in [-period_1, 0, period_2]:
-                    ax0.plot(x + (ys - np.mean(ys)) * np.tan(tilt) + cx, ys - x * np.tan(tilt), 'b-')
-            print("p1, p2: ", period_1, period_2)
-            analysis.append((period_1, period_2))
-        except Exception as e:
-            print("Exception: {}".format(e))
-    if plot:
-        return f, analysis
-    else:
-        return analysis
-
-
-def fit_periods(periods, gray_image, g=8, h=6, plot=True):
-    """Assume the smallest element is group g, element h, and analyse.
-
-    We return a dictionary with relevant parameters of the image.  This
-    fits the measured periods of elements in the image to the known
-    periods of the USAF pattern, assuming that the smallest period is
-    group <g> element <h>.  If plot is set to True, the periods are
-    plotted on a graph along with the line of best fit used to calculate
-    the magnification.
-    """
-    minp = np.max(gray_image.shape)
-    for p in periods:
-        p.sort()
-        minp = min(minp, min(p))
-
-    xs = []
-    for p in periods:
-        # The sizes ought to be quantised in the sixth root of 2
-        xs.append(2 ** (np.round(np.log(p / minp) / np.log(2) * 6) / 6))
-    # x = 2**(np.arange(len(p1))/6)
-    if plot:
-        f, ax = plt.subplots(1, 1)
-        for x, p in zip(xs, periods):
-            #todo
-            ax.plot(x, p, 'o')
-    # assume the X and Y magnifications are equal...
-    m = np.polyfit(np.concatenate(xs), np.concatenate(periods), 1)
-    if plot:
-        ax.plot(x, m[0] * x + m[1], '-')
-    print("Linear fitting gives the smallest period as {} pixels".format(m[0]))
-    rs = np.concatenate(periods) / np.concatenate(xs)
-    period_gradient = np.mean(rs)
-    period_gradient_se = np.std(rs) / np.sqrt(len(rs) - 1)
-    if plot:
-        ax.plot(x, period_gradient * x, '-')
-    print("Assuming intercept is zero gives {} +/- {}".format(rs.mean(),
-                                                              rs.std() / np.sqrt(len(rs) - 1)))
-    print("Assuming smallest block is group {}, element {},".format(g, h))
-    line_pairs_mm = 2 ** (g + (h - 1) / 6.0)
-    period_um = 1000 / line_pairs_mm
-    pixel_nm = 1000 * period_um / period_gradient
-    pixel_nm_se = pixel_nm / period_gradient * period_gradient_se
-    print("pixel size is {:.1f} +/- {:.1f} nm".format(pixel_nm, pixel_nm_se))
-    FoV = np.array(gray_image.T.shape) * pixel_nm / 1000.0
-    print("FOV is {:.1f}x{:.1f}um +/- {:.2f}%".format(FoV[0], FoV[1], pixel_nm_se / pixel_nm * 100))
-    diagonal = np.sqrt(np.sum(FoV ** 2))
-    print("diagonal is {:.1f} +/- {:.1f} um".format(diagonal,
-                                                    diagonal * pixel_nm_se / pixel_nm))
-    parameters = {
-        'group': g,
-        'element': h,
-        'pixel_nm': pixel_nm,
-        'pixel_nm_se': pixel_nm_se,
-        'field_of_view': FoV,
-        'field_of_view_x': FoV[0],
-        'field_of_view_y': FoV[1],
-        'pixels': gray_image.T.shape,
-        'pixels_x': gray_image.T.shape[0],
-        'pixels_y': gray_image.T.shape[1],
-        'diagonal': diagonal,
-        'fractional_standard_error': pixel_nm_se / pixel_nm,
-        'smallest_period_pixels': period_gradient,
-        'smallest_period_se': period_gradient_se,
-        'polyfit_coefficients': m,
-    }
-    if plot:
-        return f, parameters
-    else:
-        return parameters
+    plt.plot(LP[:len(contrasts)], contrasts)
+    plt.xlabel("no. line pairs per mm")
+    plt.ylabel("contrast (3 rows)")
+    pdf.savefig()
+    plt.close()
 
 
 def analyse_image(gray_image, pdf=None):
-    """Find USAF groups in the image and fit them to determine magnification.
+    """Find USAF groups in the image and plot their contrast as a MTF curve.
 
     This is the top-level function that you should call to analyse an image.
     The image should be a 2D numpy array.  If the optional "pdf" argument is
     supplied, several graphs will be plotted into the given PdfPages object.
 
-    returns: fig, parameters
+    returns
 
     fig is a matplotlib figure object plotting to the image with each
-    element highlighted in a box.
-    parameters is a dictionary summarising the fitted values, as returned
-    by fit_periods."""
+    element highlighted in a box."""
     elementsx, matchesx = find_elements(gray_image, return_all=True)
     elementsy, matchesy = find_elements(gray_image.T, return_all=True)
-    np.save("elementsx4.npy", elementsx)
-    np.save("elementsy4.npy", elementsy)
-    # elementsx = np.load("elementsx.npy", allow_pickle=True)
-    # elementsy = np.load("elementsy.npy", allow_pickle=True)
-    fig = plot_matches(gray_image, elementsx, elementsy)
-    fax, analysisx = analyse_elements(gray_image, elementsx, plot=True)
-    fay, analysisy = analyse_elements(gray_image.T, elementsy, plot=True)
 
-    # Now generate four lists, of first/second periods in X and Y
-    periods = [[a[i] for a in analysis]
-               for i in range(2) for analysis in (analysisx, analysisy)]
+    plot_matches(gray_image, elementsx, elementsy, pdf)
+    compute_mtf_curve(gray_image, elementsx, pdf)
+    compute_mtf_curve(gray_image.T, elementsy, pdf)
+    # fax, analysisx = analyse_elements(gray_image, elementsx, plot=True)
+    # fay, analysisy = analyse_elements(gray_image.T, elementsy, plot=True)
 
-    ffit, parameters = fit_periods(periods, gray_image)
-
-    if pdf is not None:
-        for f in [fig, fax, fay, ffit]:
-            pdf.savefig(f)
-    for f in [fax, fay, ffit]:
-        plt.close(f)
-    return fig, parameters
+    # if pdf is not None:
+    #     for f in [fig, fax, fay, ffit]:
+    #         pdf.savefig(f)
+    # for f in [fax, fay, ffit]:
+    #     plt.close(f)
+    # return fig
 
 
 def analyse_file(filename, generate_pdf=True):
     """Analyse the image file specified by the given filename"""
-    # gray_image = np.mean(imread(filename), axis=2).astype(np.uint8)
-    # print(imread(filename).shape, gray_image)
+    if '/' in filename:
+        delim = '/'
+    else:
+        delim = '\\'
+    savename = filename.split(delim)
+    savename[len(savename) - 1] = 'rotated_' + savename[len(savename) - 1]
+    new_fn = delim.join(savename)
+
     gray_image = imread(filename).astype(np.uint8)
-    #image = imread(filename)
+
     fine_angle = find_image_orientation(gray_image)
-    print(math.degrees(fine_angle))
     if math.degrees(fine_angle) > 90:
         angle = 180 - math.degrees(fine_angle)
     new_image = rotate(gray_image, angle)
-    #fine_angle = find_image_orientation(new_image)
-    #print(math.degrees(fine_angle))
-    # new_image = rotate(new_image, math.degrees(fine_angle))
-    new_fn = f'new_{filename}.bmp'
+
     io.imsave(new_fn, new_image)
     gray_image = imread(new_fn).astype(np.uint8)
-    #fine_angle = find_image_orientation(image)
-    #gray_image = rotate(image, angle=math.degrees(fine_angle)).astype(np.uint8)
 
-    with PdfPages(filename + "_analysis.pdf") as pdf:
-        fig, parameters = analyse_image(gray_image, pdf)
-        with open(filename + "_analysis.txt", 'w') as text:
-            text.write("Assuming the smallest element is number {element} from group {group}.\n".format(**parameters))
-            text.write("That means one pixel is {pixel_nm} +/- {pixel_nm_se} nm.\n".format(**parameters))
-            text.write("The field of view is {field_of_view} um.\n".format(**parameters))
-            text.write("\n")
-
-            text.write("pixel_nm: {}\n".format(parameters['pixel_nm']))
-            text.write("pixel_nm_se: {}\n".format(parameters['pixel_nm_se']))
-        fig.suptitle(filename)
-        return fig, parameters
+    with PdfPages(new_fn + "_analysis.pdf") as pdf:
+        analyse_image(gray_image, pdf)
+        # fig = analyse_image(gray_image, pdf)
+        # pdf.suptitle(filename)
+        #return fig
 
 
 def analyse_folders(datasets):
@@ -451,17 +343,11 @@ def analyse_folders(datasets):
     files = []
     for dir in [os.path.join(datasets, d) for d in os.listdir(datasets)]:  # if d.startswith('6led')]:
         files += [os.path.join(dir, f) for f in os.listdir(dir) if f.startswith("usaf_") and f.endswith(".jpg")]
-    summary_data_columns = ['group', 'element', 'pixel_nm', 'pixel_nm_se', 'diagonal',
-                            'fractional_standard_error', 'smallest_period_pixels', 'smallest_period_se', 'pixels_x',
-                            'pixels_y', 'field_of_view_x', 'field_of_view_y']
-    with PdfPages("usaf_calibration.pdf") as pdf, \
-            open("usaf_calibration_summary.csv", "w") as summary_text:
-        summary_text.write("filename, " + ", ".join(summary_data_columns) + "\n")
+
+    with PdfPages("usaf_calibration.pdf") as pdf:
         for filename in files:
             print("\nAnalysing file {}".format(filename))
-            fig, parameters = analyse_file(filename)
-            pdf.savefig(fig)
-            summary_text.write(", ".join([filename] + [str(parameters[c]) for c in summary_data_columns]) + "\n")
+            analyse_file(filename)
 
 
 if __name__ == '__main__':
