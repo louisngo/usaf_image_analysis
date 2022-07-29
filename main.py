@@ -111,7 +111,7 @@ def template(n):
 
 def find_elements(image,
                   template_fn=template,
-                  scale_increment=1.02,
+                  scale_increment=1.015,
                   n_scales=300,
                   return_all=True):
     """Use a multi-scale template match to find groups of 3 bars in the image.
@@ -258,10 +258,10 @@ def compute_mtf_curve(image, elements, pdf=None):
         f, (ax1, ax2) = plt.subplots(1, 2)
         gray_roi = image[y:y + n, x:x + n]
         ax1.imshow(gray_roi)
-        ax1.plot()
+        # ax1.plot()
         contrasts.append(approx_contrast(gray_roi, pdf, ax2))
 
-    plt.plot(LP[:len(contrasts)], contrasts)
+    plt.plot(LP[:len(contrasts)], contrasts, 'o-')
     plt.xlabel("no. line pairs per mm")
     plt.ylabel("contrast (3 rows)")
     pdf.savefig()
@@ -304,9 +304,10 @@ def analyse_file(filename, generate_pdf=True):
 
     gray_image = imread(filename).astype(np.uint8)
 
-    fine_angle = find_image_orientation(gray_image)
-    if math.degrees(fine_angle) > 90:
-        angle = 180 - math.degrees(fine_angle)
+    # angle = find_image_orientation(gray_image)
+    # if math.degrees(angle) > 90:
+    #     angle = 180 - math.degrees(angle)
+    angle = 45
     new_image = rotate(gray_image, angle)
 
     io.imsave(new_fn, new_image)
