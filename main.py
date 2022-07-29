@@ -5,6 +5,7 @@ Analyse a USAF test target image, to determine the image's dimensions.
 See: https://en.wikipedia.org/wiki/1951_USAF_resolution_test_chart
 
 (c) Richard Bowman 2017, released under GNU GPL
+    modified by Louis Ngo 2022
 
 
 From Wikipedia, the number of line pairs/mm is 2^(g+(h-1)/6) where g is the
@@ -17,20 +18,11 @@ from __future__ import print_function
 from matplotlib import pyplot as plt
 import matplotlib.patches
 
-from skimage import data
-from skimage.feature import corner_harris, corner_subpix, corner_peaks
-from skimage.transform import warp, AffineTransform
-from skimage.draw import ellipse
-from skimage.io import imread
 import numpy as np
 import cv2
-import imutils
-from sklearn.cluster import MeanShift
-from contextlib import closing
 
 import scipy.ndimage
 import scipy.interpolate
-import itertools
 import os.path
 import os
 import sys
@@ -154,7 +146,6 @@ def find_elements(image,
     scores = np.array([m[0] for m in matches])
     threshold_score = (scores.max() + scores.min()) / 2
     filtered_matches = [m for m in matches if m[0] > threshold_score]
-    # filtered_matches = matches
 
     # Group overlapping matches together, and pick the best one
     def overlap1d(x1, n1, x2, n2):
@@ -215,7 +206,6 @@ def plot_matches(image, elements, elements_T=[], pdf=None):
 
     pdf.savefig(f)
     plt.close(f)
-    # return f
 
 
 def approx_contrast(image, pdf=None, ax=None):
@@ -295,26 +285,22 @@ def analyse_image(gray_image, pdf=None):
     plot_matches(gray_image, elementsx, elementsy, pdf)
     compute_mtf_curve(gray_image, elementsx, pdf)
     compute_mtf_curve(gray_image.T, elementsy, pdf)
-    # fax, analysisx = analyse_elements(gray_image, elementsx, plot=True)
-    # fay, analysisy = analyse_elements(gray_image.T, elementsy, plot=True)
-
-    # if pdf is not None:
-    #     for f in [fig, fax, fay, ffit]:
-    #         pdf.savefig(f)
-    # for f in [fax, fay, ffit]:
-    #     plt.close(f)
-    # return fig
 
 
 def analyse_file(filename, generate_pdf=True):
     """Analyse the image file specified by the given filename"""
+    delim = None
     if '/' in filename:
         delim = '/'
-    else:
+    elif '\\' in filename:
         delim = '\\'
-    savename = filename.split(delim)
-    savename[len(savename) - 1] = 'rotated_' + savename[len(savename) - 1]
-    new_fn = delim.join(savename)
+
+    if delim is not None:
+        savename = filename.split(delim)
+        savename[len(savename) - 1] = 'rotated_' + savename[len(savename) - 1]
+        new_fn = delim.join(savename)
+    else:
+        new_fn = 'rotated_' + filename
 
     gray_image = imread(filename).astype(np.uint8)
 
@@ -328,9 +314,6 @@ def analyse_file(filename, generate_pdf=True):
 
     with PdfPages(new_fn + "_analysis.pdf") as pdf:
         analyse_image(gray_image, pdf)
-        # fig = analyse_image(gray_image, pdf)
-        # pdf.suptitle(filename)
-        #return fig
 
 
 def analyse_folders(datasets):
